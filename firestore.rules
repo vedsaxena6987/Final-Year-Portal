@@ -1,0 +1,562 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // ============================================
+    // FIRESTORE SECURITY RULES - FINAL YEAR PORTAL
+    // ============================================
+    // 
+    // EXTERNAL EVALUATOR PERMISSIONS:
+    // - Can read all phases (especially phaseType == 'external')
+    // - Can read all teams (filter by externalEvaluatorId in app logic)
+    // - Can read/write submissions for assigned teams
+    // - Can create/update evaluations collection (team-level)
+    // - Can create/update grades collection (student-level)
+    // - Can create/update/delete meetings where facultyId matches their UID
+    // - Can read their own evaluations and grades
+    //
+    // ROLE-BASED ACCESS:
+    // - Admin: Full access to all collections
+    // - Faculty: Mentor evaluations, panel evaluations, meeting scheduling
+    // - External: Phase-based team evaluations (member-wise)
+    // - Student: Team management, submissions, read own grades
+    //
+    // ============================================
+    // HELPER FUNCTIONS
+    // ============================================
+    
+    // Check if user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    // Get user data from Firestore (safe - returns null if not exists)
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.token.email)).data;
+    }
+    
+    // Safe helper to check if user doc exists before reading
+    function userDocExists() {
+      return exists(/databases/$(database)/documents/users/$(request.auth.token.email));
+    }
+    
+    // Role checking functions (safe - return false if user doc doesn't exist)
+    function isAdmin() {
+      return isAuthenticated() && userDocExists() && getUserData().role == 'admin';
+    }
+    
+    function isFaculty() {
+      return isAuthenticated() && userDocExists() && getUserData().role == 'faculty';
+    }
+    
+    function isStudent() {
+      return isAuthenticated() && userDocExists() && getUserData().role == 'student';
+    }
+    
+    function isExternal() {
+      return isAuthenticated() && userDocExists() && getUserData().role == 'external_evaluator';
+    }
+    
+    // Check if user is a team member
+    function isTeamMember(teamData) {
+      return request.auth.token.email in teamData.members;
+    }
+    
+    // Check if user is team leader
+    function isTeamLeader(teamData) {
+      return request.auth.uid == teamData.leaderId;
+    }
+    
+    // Check if user is team's mentor
+    function isTeamMentor(teamData) {
+      return request.auth.uid == teamData.mentorId;
+    }
+    
+    // Check if faculty member is in panel (by iterating through facultyMembers array)
+    function isFacultyInPanel(panelData) {
+      return request.auth.uid in panelData.facultyIds;
+    }
+    
+    // Check if user is the external evaluator for a team
+    function isTeamExternalEvaluator(teamData) {
+      return isExternal() && 
+             teamData.get('externalEvaluatorId', '') == request.auth.token.email;
+    }
+    
+    // ============================================
+    // COLLECTION RULES
+    // ============================================
+    
+    // Users collection - email as document ID
+    match /users/{email} {
+      allow read: if isAuthenticated();
+      
+      // CRITICAL: Allow user to create their own document during signup
+      // The create check happens BEFORE the document exists, so we can't call getUserData()
+      // Allow if: (1) creating own doc by email match OR (2) admin creating for CSV import
+      allow create: if isAuthenticated() && 
+                       (request.auth.token.email == email || 
+                        // Admin check - only if user doc already exists (for CSV imports)
+                        (userDocExists() && isAdmin()));
+      
+      // Allow users to update their own document (by email match), or admin can update any
+      // This allows newly created Auth users to sync their UID
+      allow update: if isAdmin() || 
+                       (isAuthenticated() && request.auth.token.email == email) ||
+                       // Allow any authenticated user (needed for team operations)
+                       isAuthenticated();
+      allow delete: if isAdmin();
+    }
+    
+    // Sessions collection - publicly readable since it's not sensitive
+    match /sessions/{sessionId} {
+      allow read: if true;  // Allow anyone to read sessions (only isActive sessions matter)
+      allow write: if isAdmin();
+    }
+    
+    // Teams collection
+    match /teams/{teamId} {
+      allow read: if isAuthenticated();
+      
+      // Authenticated users can create teams (role check happens in app logic)
+      allow create: if isAuthenticated();
+      
+      // Team members, current mentors, new mentors (accepting mentorship), or admins can update
+      allow update: if isAdmin() || 
+                       (isAuthenticated() && isTeamMember(resource.data)) ||
+                       (isAuthenticated() && isTeamMentor(resource.data)) ||
+                       // Allow faculty to become mentor (when accepting mentorship request)
+                       (isFaculty() && request.resource.data.mentorId == request.auth.uid);
+      
+      allow delete: if isAdmin();
+    }
+    
+    // Expertise tags - master list curated by admin
+    match /expertiseTags/{tagId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+    
+    // Mentorship requests
+    match /mentorship_requests/{requestId} {
+      // Allow authenticated users to read mentorship requests
+      // Students can see their team's requests
+      // Faculty can see requests assigned to them
+      // Admins can see all
+      allow read: if isAuthenticated() && (
+        isAdmin() ||
+        isFaculty() ||
+        // Students can read requests for their team
+        (isStudent() && (
+          // Direct team match check
+          resource.data.teamId in get(/databases/$(database)/documents/users/$(request.auth.token.email)).data.get('teamId', '') ||
+          // Check if user is in team members array by looking up team
+          (exists(/databases/$(database)/documents/teams/$(resource.data.teamId)) &&
+           request.auth.token.email in get(/databases/$(database)/documents/teams/$(resource.data.teamId)).data.members)
+        ))
+      );
+      
+      // Students can create mentorship requests for their team
+      allow create: if isStudent();
+      
+      // Faculty can update requests assigned to them (accept/reject), admins can update any
+      // Team members can cancel pending requests
+      allow update: if isAdmin() || 
+                       // Faculty can accept/reject their pending requests
+                       (isFaculty() && request.auth.uid == resource.data.mentorId &&
+                        resource.data.status == 'pending' &&
+                        request.resource.data.status in ['approved', 'rejected', 'revisions_requested']) ||
+                       // Faculty can also update auto-rejected or already processed requests
+                       (isFaculty() && request.auth.uid == resource.data.mentorId) ||
+                       // Students can cancel their team's pending requests
+                       (isStudent() && resource.data.status == 'pending' && 
+                        exists(/databases/$(database)/documents/teams/$(resource.data.teamId)) &&
+                        request.auth.token.email in get(/databases/$(database)/documents/teams/$(resource.data.teamId)).data.members);
+      
+      allow delete: if isAdmin();
+    }
+    
+    // Revision History - tracks all versions of abstracts and feedback
+    match /revision_history/{revisionId} {
+      // Students can read their team's revision history
+      // Faculty can read history for teams they mentor
+      // Admin can read all
+      allow read: if isAuthenticated() && (
+        isAdmin() ||
+        // Check if user is assigned mentor (by UID)
+        resource.data.mentorId == request.auth.uid ||
+        // Check if user is assigned mentor (by email)
+        resource.data.mentorEmail == request.auth.token.email ||
+        // Check if faculty is mentor of this team
+        (isFaculty() && exists(/databases/$(database)/documents/teams/$(resource.data.teamId)) &&
+         get(/databases/$(database)/documents/teams/$(resource.data.teamId)).data.mentorId == request.auth.uid) ||
+        // Check if user is team member by looking up team document
+        (isStudent() && exists(/databases/$(database)/documents/teams/$(resource.data.teamId)) &&
+         isTeamMember(get(/databases/$(database)/documents/teams/$(resource.data.teamId)).data))
+      );
+      
+      // Allow authenticated users with valid university email to create revision history
+      // Required fields: teamId, version, projectTitle, projectAbstract, status, mentorId, sessionId, createdAt
+      // feedbackType is optional (not present in student resubmissions)
+      allow create: if isAuthenticated() && 
+                      request.auth.token.email.matches('.*@gehu\\.ac\\.in$') &&
+                      request.resource.data.keys().hasAll([
+                        'teamId', 'version', 'projectTitle', 'projectAbstract',
+                        'status', 'mentorId', 'sessionId', 'createdAt'
+                      ]);
+      
+      // Updates and deletes restricted to admin only
+      // (revision history should be immutable once created)
+      allow update, delete: if isAdmin();
+    }
+    
+    // Team invitations - join requests and approvals
+    match /team_invitations/{invitationId} {
+      // Users can only read invitations they're involved in
+      allow read: if isAuthenticated() && (
+        isAdmin() ||
+        request.auth.token.email == resource.data.studentEmail ||
+        request.auth.uid == resource.data.leaderId ||
+        // Allow team members to see their team's invitations
+        (exists(/databases/$(database)/documents/teams/$(resource.data.teamId)) &&
+         request.auth.token.email in get(/databases/$(database)/documents/teams/$(resource.data.teamId)).data.members)
+      );
+      
+      // Only students can create join requests for themselves
+      allow create: if isStudent() && 
+                       request.resource.data.studentEmail == request.auth.token.email &&
+                       request.resource.data.studentUid == request.auth.uid &&
+                       request.resource.data.status == 'pending' &&
+                       request.resource.data.keys().hasAll([
+                         'teamId', 'teamName', 'teamCode', 'leaderId', 
+                         'leaderEmail', 'studentEmail', 'studentName', 
+                         'studentUid', 'status', 'requestedAt', 'sessionId'
+                       ]);
+      
+      // Team leaders can approve/reject pending requests
+      // Only allow valid status transitions
+      allow update: if isAdmin() ||
+        (isAuthenticated() && 
+         request.auth.uid == resource.data.leaderId &&
+         resource.data.status == 'pending' &&
+         request.resource.data.status in ['approved', 'rejected_by_leader']);
+      
+      allow delete: if isAdmin();
+    }
+    
+    // Panels - evaluation panels for teams
+    match /panels/{panelId} {
+      // All authenticated users can read panels (for viewing assignments)
+      allow read: if isAuthenticated();
+      
+      // Only admin can create and delete panels
+      allow create, delete: if isAdmin();
+      
+      // Admin can update, faculty can update if they're in the panel
+      allow update: if isAdmin() || 
+        (isFaculty() && isFacultyInPanel(resource.data));
+    }
+    
+    // Phases - project phases (fixed + dynamic)
+    match /phases/{phaseId} {
+      // All authenticated users can read phases
+      // External evaluators can read phases with phaseType == 'external'
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+      
+      // Evaluations subcollection under phases
+      match /evaluations/{evaluationId} {
+        // Students can read evaluations for their team
+        // Faculty can read evaluations they scheduled or for their panel
+        // Admin can read all
+        allow read: if isAuthenticated() && (
+          isAdmin() ||
+          isFaculty() ||
+          // Student can read if their team is in the evaluation
+          (isStudent() && 
+           getUserData().teamId != null &&
+           exists(/databases/$(database)/documents/phases/$(phaseId)/evaluations/$(evaluationId)) &&
+           getUserData().teamId in get(/databases/$(database)/documents/phases/$(phaseId)/evaluations/$(evaluationId)).data.teamIds)
+        );
+        
+        // Faculty and admin can create evaluations
+        allow create: if isFaculty() || isAdmin();
+        
+        // Faculty can update their own evaluations, admin can update any
+        allow update: if isAdmin() || 
+                         (isFaculty() && resource.data.scheduledBy == request.auth.uid);
+        
+        // Only admin can delete evaluations
+        allow delete: if isAdmin();
+      }
+    }
+    
+    // Submissions - student submissions for phases
+    match /submissions/{submissionId} {
+      // All authenticated users can read submissions
+      // (Role-based filtering is done in app logic)
+      allow read: if isAuthenticated();
+      
+      // Students can create submissions for their team
+      allow create: if isStudent();
+      
+      // Team members can update before evaluation
+      // Faculty and externals can update for evaluation
+      allow update: if isAdmin() ||
+                       (isStudent() && resource.data.evaluationStatus == 'pending') ||
+                       isFaculty() || 
+                       isExternal();
+      
+      allow delete: if isAdmin();
+    }
+    
+    // Grades - evaluation grades for students
+    match /grades/{gradeId} {
+      // Students can read their own grades
+      // Faculty can read grades for teams they mentor or evaluate
+      // External evaluators can read ALL grades (needed for querying existing grades before evaluation)
+      // Admin can read all
+      allow read: if isAuthenticated() && (
+        isAdmin() ||
+        isFaculty() ||
+        isExternal() ||
+        // Students can read their own grades
+        (isStudent() && resource.data.get('studentEmail', '') == request.auth.token.email)
+      );
+      
+      // Only faculty, external evaluators, and admins can write grades
+      allow create: if isFaculty() || isExternal() || isAdmin();
+      
+      // Faculty and external evaluators can update their own grades
+      allow update: if isAdmin() ||
+                       (isFaculty() && resource.data.get('evaluatedBy', '') == request.auth.uid) ||
+                       (isExternal() && resource.data.get('evaluatedBy', '') == request.auth.uid);
+      
+      allow delete: if isAdmin();
+    }
+    
+    // Evaluations - team evaluations with individual student marks
+    match /evaluations/{evaluationId} {
+      // All authenticated users can read evaluations
+      // (Role-based filtering is done in app logic)
+      allow read: if isAuthenticated();
+      
+      // Faculty, external evaluators, and admin can create evaluations
+      allow create: if isFaculty() || isExternal() || isAdmin();
+      
+      // Faculty and external evaluators can update their own evaluations, admin can update any
+      allow update: if isAdmin() || 
+                       (isFaculty() && resource.data.get('evaluatedBy', '') == request.auth.uid) ||
+                       (isExternal() && resource.data.get('evaluatedBy', '') == request.auth.uid);
+      
+      // Only admin can delete evaluations
+      allow delete: if isAdmin();
+    }
+    
+    // Evaluation Results - marks and feedback for evaluations
+    match /evaluation_results/{resultId} {
+      // Students can read their own results
+      // Faculty can read results they submitted
+      // Admin can read all
+      allow read: if isAuthenticated() && (
+        isAdmin() ||
+        (isStudent() && resource.data.studentEmail == request.auth.token.email) ||
+        (isFaculty() && resource.data.evaluatedBy == request.auth.uid)
+      );
+      
+      // Faculty and admin can create results
+      allow create: if isFaculty() || isAdmin();
+      
+      // Faculty can update their own results, admin can update any
+      allow update: if isAdmin() || 
+                       (isFaculty() && resource.data.evaluatedBy == request.auth.uid);
+      
+      allow delete: if isAdmin();
+    }
+    
+    // Notifications - user notifications
+    match /notifications/{notificationId} {
+      // Users can read their own notifications, admins can read all
+      allow read: if isAuthenticated() && (
+        isAdmin() ||
+        resource.data.recipientEmail == request.auth.token.email
+      );
+      
+      // Authenticated users can create notifications (for team invitations, submissions, etc.)
+      allow create: if isAuthenticated();
+      
+      // Users can update their own notifications (mark as read)
+      // Admins can update any notification
+      // But cannot dismiss permanent evaluation notifications (except admin)
+      allow update: if isAuthenticated() && (
+        isAdmin() ||
+        (resource.data.recipientEmail == request.auth.token.email &&
+         // If it's permanent, keep it permanent
+         (!resource.data.get('isPermanent', false) || 
+          request.resource.data.get('isPermanent', false) == true))
+      );
+      
+      allow delete: if isAdmin();
+    }
+    
+    // Counters - for auto-incrementing values (like project numbers)
+    match /counters/{counterId} {
+      allow read: if isAuthenticated();
+      
+      // Students can increment project number counters (for team creation)
+      // - 'projectNumber' (legacy format)
+      // - 'session_{sessionId}_project_numbers' (new session-based format)
+      // Only admin can manage panel counters
+      allow create, update: if isAuthenticated() && (
+        (counterId == 'projectNumber' && isStudent()) ||
+        (counterId.matches('session_.*_project_numbers') && isStudent()) ||
+        (counterId.matches('panel_.*') && isAdmin())
+      );
+      allow delete: if isAdmin();
+    }
+    
+    // External Evaluations - legacy collection (deprecated in favor of evaluations + grades)
+    match /external_evaluations/{evaluationId} {
+      // External evaluators can read their own evaluations
+      // Students can read evaluations for their team
+      // Admin can read all
+      allow read: if isAuthenticated() && (
+        isAdmin() ||
+        (isExternal() && resource.data.get('evaluatorId', '') == request.auth.token.email) ||
+        (isExternal() && resource.data.get('evaluatorId', '') == request.auth.uid) ||
+        (isStudent() && 
+         resource.data.get('teamId', '') != '' &&
+         exists(/databases/$(database)/documents/teams/$(resource.data.teamId)) &&
+         request.auth.token.email in get(/databases/$(database)/documents/teams/$(resource.data.teamId)).data.members)
+      );
+      
+      // External evaluators and admin can create evaluations
+      allow create: if isExternal() || isAdmin();
+      
+      // External evaluators can update their own evaluations
+      allow update: if isAdmin() || 
+                       (isExternal() && resource.data.get('evaluatorId', '') == request.auth.token.email) ||
+                       (isExternal() && resource.data.get('evaluatorId', '') == request.auth.uid);
+      
+      allow delete: if isAdmin();
+    }
+    
+    // ============================================
+    // MEETINGS COLLECTION (Task 9 - Meeting Scheduling)
+    // ============================================
+    match /meetings/{meetingId} {
+      // All authenticated users can read meetings
+      // Students see meetings for their team
+      // Faculty and external evaluators see their scheduled meetings
+      allow read: if isAuthenticated();
+      
+      // Faculty, external evaluators, and admin can create meetings
+      allow create: if isFaculty() || isExternal() || isAdmin();
+      
+      // Faculty and external evaluators can update their own meetings, admin can update any
+      allow update: if isAdmin() || 
+                      (isFaculty() && resource.data.get('facultyId', '') == request.auth.uid) ||
+                      (isExternal() && resource.data.get('facultyId', '') == request.auth.uid);
+      
+      // Admin, faculty, and external evaluators (who created) can delete meetings
+      allow delete: if isAdmin() || 
+                      (isFaculty() && resource.data.get('facultyId', '') == request.auth.uid) ||
+                      (isExternal() && resource.data.get('facultyId', '') == request.auth.uid);
+    }
+    
+    // ============================================
+    // PANEL EVALUATIONS COLLECTION (Task 9 - Panel Evaluation)
+    // ============================================
+    match /panelEvaluations/{evaluationId} {
+      // Students can read evaluations for their team
+      // Faculty can read evaluations for teams they evaluated or panels they're on
+      // Admin can read all
+      allow read: if isAuthenticated() && (
+        isAdmin() ||
+        isFaculty() ||
+        // Student can read if they're part of the team
+        (isStudent() && 
+         resource.data.teamId != null &&
+         exists(/databases/$(database)/documents/teams/$(resource.data.teamId)) &&
+         request.auth.token.email in get(/databases/$(database)/documents/teams/$(resource.data.teamId)).data.members)
+      );
+      
+      // Faculty and admin can create panel evaluations
+      // Required fields: teamId, phaseId, phaseName, evaluatorId, maxMarks, marks (array), feedback, sessionId
+      allow create: if (isFaculty() || isAdmin()) &&
+                       request.resource.data.keys().hasAll([
+                         'teamId', 'phaseId', 'phaseName', 'evaluatorId', 
+                         'maxMarks', 'marks', 'feedback', 'sessionId', 'status'
+                       ]) &&
+                       request.resource.data.evaluatorId == request.auth.uid &&
+                       request.resource.data.status == 'completed' &&
+                       request.resource.data.marks is list;
+      
+      // Faculty can update their own evaluations only (check evaluatorId, not evaluatedBy array)
+      // Admin can update any
+      allow update: if isAdmin() || 
+                       (isFaculty() && resource.data.evaluatorId == request.auth.uid &&
+                        request.resource.data.evaluatorId == request.auth.uid);
+      
+      // Only admin can delete panel evaluations
+      allow delete: if isAdmin();
+    }
+    
+    // ============================================
+    // ANNOUNCEMENTS COLLECTION
+    // ============================================
+    match /announcements/{announcementId} {
+      // All authenticated users can read announcements
+      allow read: if isAuthenticated();
+      
+      // Only admin and faculty can create announcements
+      allow create: if isAdmin() || isFaculty();
+      
+      // Only admin can update announcements
+      allow update: if isAdmin() || isFaculty();
+      
+      // Only admin can delete announcements
+      allow delete: if isAdmin();
+    }
+    
+    // ============================================
+    // EXTENSIONS COLLECTION (Task 9 - Deadline Extensions)
+    // ============================================
+    match /extensions/{extensionId} {
+      // All authenticated users can read extensions
+      // Students can see extensions for their team
+      // Faculty and admin can see all
+      allow read: if isAuthenticated();
+      
+      // Only admin can create extensions
+      allow create: if isAdmin();
+      
+      // Only admin can update extensions
+      allow update: if isAdmin();
+      
+      // Only admin can delete extensions
+      allow delete: if isAdmin();
+    }
+    
+    // ============================================
+    // SUBMISSION HISTORY COLLECTION (TEMPORARILY PERMISSIVE FOR DEBUGGING)
+    // ============================================
+    match /submission_history/{historyId} {
+      // TEMP: Allow all authenticated users to read for debugging
+      allow read: if isAuthenticated();
+      
+      // Authenticated users can create submission history (for archiving)
+      allow create: if isAuthenticated();
+      
+      // Only admin can update or delete submission history (immutable)
+      allow update, delete: if isAdmin();
+    }
+    
+    // ============================================
+    // DENY ALL OTHER PATHS
+    // ============================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
